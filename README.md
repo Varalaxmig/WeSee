@@ -1,22 +1,19 @@
-# Swift Delivery
+# WeSee
 
-make it asap
+An AI vision assistant for people with low vision. Point your camera, tap the screen, and hear a short spoken description of the scene in front of you.
 
-This project was built with [Lovable](https://lovable.dev).
+## Features
 
-**Live app**: https://speedy-sparkle-joy.lovable.app
-
-## Build with Lovable
-
-Continue developing this project in the [Lovable editor](https://lovable.dev/projects/e8195667-3931-4810-89cd-0cdd7688e84c).
-
-- **Ship faster**: describe what you want to build and Lovable handles the code.
-- **Stay in sync**: every change made in Lovable is committed straight to this repository.
-- **Full ownership**: this code is yours. Push to `main` on GitHub and your changes sync back into Lovable, ready for your next prompt.
+- **Camera-based scene description** — tap anywhere to scan what's in front of you
+- **Text-to-speech** — hear descriptions read aloud automatically
+- **Hazard detection** — obstacles, stairs, poles, and vehicles are mentioned first
+- **Rupee note recognition** — identifies Indian currency denominations
+- **PWA support** — install on your home screen for quick access
+- **High-contrast UI** — designed for low-vision accessibility
 
 ## Development
 
-Prefer working locally? You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating).
+You need Node.js and npm — [install with nvm](https://github.com/nvm-sh/nvm#installing-and-updating).
 
 ```sh
 git clone <this-repository-url>

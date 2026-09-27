@@ -10,80 +10,68 @@ Rules:
 - If you are unsure, say "I am not sure" rather than guessing.
 Keep the whole answer under 40 words.`;
 
-const Input = z.object({
+const DescribeInput = z.object({
   imageBase64: z.string().min(100),
 });
 
 export const describeScene = createServerFn({ method: "POST" })
-  .inputValidator((data: unknown) => Input.parse(data))
+  .validator((data: unknown) => DescribeInput.parse(data))
   .handler(async ({ data }) => {
-    const apiKey = process.env["LOVABLE_API_KEY"];
+    const apiKey = process.env["GROQ_API_KEY"];
     if (!apiKey) {
-      return { success: false as const, error: "Vision service is not configured." };
+      return { success: false as const, error: "Vision service is not configured. Set GROQ_API_KEY in .env" };
     }
 
     const started = Date.now();
-    const res = await fetch("https://ai.gateway.lovable.dev/v1/responses", {
+
+    // Groq uses OpenAI-compatible chat completions with vision
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
-        "X-Lovable-AIG-SDK": "fetch",
       },
       body: JSON.stringify({
-        model: "openai/gpt-6-astra",
-        store: false,
-        stream: true,
-        reasoning: { effort: "low" },
-        input: [
+        model: "qwen/qwen3.8-27b",
+        max_tokens: 150,
+        messages: [
           {
             role: "user",
             content: [
-              { type: "input_text", text: PROMPT },
-              { type: "input_image", image_url: data.imageBase64 },
+              { type: "text", text: PROMPT },
+              {
+                type: "image_url",
+                image_url: { url: data.imageBase64 },
+              },
             ],
           },
         ],
       }),
     });
 
-    if (!res.ok || !res.body) {
+    if (!res.ok) {
       const status = res.status;
+      let errorDetail = "";
+      try {
+        const errorJson = (await res.json()) as { error?: { message?: string } };
+        errorDetail = errorJson.error?.message || "";
+      } catch {
+        errorDetail = await res.text().catch(() => "");
+      }
+      console.error("[WeSee] Groq error:", status, errorDetail);
       let message = "I could not scan that. Check your connection and tap to try again.";
       if (status === 429) message = "Too many scans right now. Wait a moment and tap again.";
-      if (status === 402) message = "The vision service is out of credits.";
+      if (status === 401) message = "Invalid API key. Check GROQ_API_KEY in your .env file.";
+      if (status === 413) message = "Image is too large. Try moving closer and scanning again.";
       return { success: false as const, error: message, status };
     }
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let text = "";
+    const json = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    let description = json.choices?.[0]?.message?.content?.trim() ?? "";
+    description = description.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split("\n\n");
-      buffer = frames.pop() ?? "";
-      for (const frame of frames) {
-        for (const line of frame.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const payload = line.slice(5).trim();
-          if (!payload || payload === "[DONE]") continue;
-          try {
-            const evt = JSON.parse(payload);
-            if (evt.type === "response.output_text.delta" && typeof evt.delta === "string") {
-              text += evt.delta;
-            }
-          } catch {
-            // ignore partial frame
-          }
-        }
-      }
-    }
-
-    const description = text.trim();
     if (!description) {
       return {
         success: false as const,
@@ -95,5 +83,53 @@ export const describeScene = createServerFn({ method: "POST" })
       success: true as const,
       description,
       latencyMs: Date.now() - started,
+    };
+  });
+
+// Sarvam TTS server function
+const TTSInput = z.object({
+  text: z.string().min(1).max(2500),
+  language: z.string().default("en-IN"),
+});
+
+export const speakWithSarvam = createServerFn({ method: "POST" })
+  .validator((data: unknown) => TTSInput.parse(data))
+  .handler(async ({ data }) => {
+    const apiKey = process.env["SARVAM_API_KEY"];
+    if (!apiKey) {
+      // Graceful fallback — client will use browser speechSynthesis
+      return { success: false as const, error: "Sarvam TTS not configured" };
+    }
+
+    const res = await fetch("https://api.sarvam.ai/text-to-speech", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-subscription-key": apiKey,
+      },
+      body: JSON.stringify({
+        inputs: [data.text],
+        target_language_code: data.language,
+        model: "bulbul:v3",
+        speaker: "priya",
+        pace: 1.0,
+        enable_preprocessing: true,
+      }),
+    });
+
+    if (!res.ok) {
+      return { success: false as const, error: `Sarvam TTS error: ${res.status}` };
+    }
+
+    const json = await res.json() as { audios?: string[] };
+    const audioBase64 = json.audios?.[0];
+
+    if (!audioBase64) {
+      return { success: false as const, error: "No audio returned from Sarvam" };
+    }
+
+    return {
+      success: true as const,
+      audioBase64,
     };
   });

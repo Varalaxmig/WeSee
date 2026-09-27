@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { describeScene } from "@/lib/describe.functions";
+import { describeScene, speakWithSarvam } from "@/lib/describe.functions";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -32,7 +32,7 @@ const PRIVACY_TEXT =
 
 type Status = "idle" | "starting" | "ready" | "scanning" | "error";
 
-function speak(text: string) {
+function speakBrowser(text: string) {
   if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
   window.speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
@@ -63,6 +63,29 @@ function WeSee() {
   const [showNotice, setShowNotice] = useState(false);
 
   const describe = useServerFn(describeScene);
+  const sarvamTTS = useServerFn(speakWithSarvam);
+
+  // Speak using Sarvam TTS first, fallback to browser speechSynthesis
+  const speak = useCallback(
+    async (text: string) => {
+      try {
+        // Stop any ongoing browser speech
+        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+        }
+        const result = await sarvamTTS({ data: { text, language: "en-IN" } });
+        if (result.success && result.audioBase64) {
+          const audio = new Audio(`data:audio/wav;base64,${result.audioBase64}`);
+          audio.play().catch(() => speakBrowser(text));
+          return;
+        }
+      } catch {
+        // Sarvam unavailable — fall through
+      }
+      speakBrowser(text);
+    },
+    [sarvamTTS],
+  );
 
   useEffect(() => {
     const seen =
@@ -85,16 +108,16 @@ function WeSee() {
       setStatus("ready");
       setStatusText("Ready");
       setCaption("Tap anywhere to scan.");
-      speak("WeSee is ready. Tap anywhere to scan.");
+      void speak("WeSee is ready. Tap anywhere to scan.");
     } catch {
       setStatus("error");
       setStatusText("No camera");
       const msg =
         "I cannot reach the camera. Allow camera access in your browser settings, then tap to try again.";
       setCaption(msg);
-      speak(msg);
+      void speak(msg);
     }
-  }, []);
+  }, [speak]);
 
   useEffect(() => {
     if (!showNotice) void startCamera();
@@ -106,8 +129,8 @@ function WeSee() {
   };
 
   useEffect(() => {
-    if (showNotice) speak(PRIVACY_TEXT);
-  }, [showNotice]);
+    if (showNotice) void speak(PRIVACY_TEXT);
+  }, [showNotice, speak]);
 
   const scan = useCallback(async () => {
     if (scanningRef.current) return;
@@ -123,7 +146,7 @@ function WeSee() {
     setStatus("scanning");
     setStatusText("Scanning…");
     setCaption("");
-    speak("Scanning");
+    void speak("Scanning");
     buzz(60);
 
     try {
@@ -142,13 +165,13 @@ function WeSee() {
         setStatusText("Result");
         setCaption(result.description);
         setLastResult(result.description);
-        speak(result.description);
+        void speak(result.description);
         buzz([40, 80, 40]);
       } else {
         setStatus("ready");
         setStatusText("Failed");
         setCaption(result.error);
-        speak(result.error);
+        void speak(result.error);
         buzz(300);
       }
     } catch {
@@ -156,17 +179,17 @@ function WeSee() {
       setStatus("ready");
       setStatusText("Failed");
       setCaption(msg);
-      speak(msg);
+      void speak(msg);
       buzz(300);
     } finally {
       scanningRef.current = false;
     }
-  }, [describe, startCamera, status]);
+  }, [describe, speak, startCamera, status]);
 
   const repeat = useCallback(() => {
     if (scanningRef.current) return;
-    speak(lastResult || "There is no result yet. Tap once to scan.");
-  }, [lastResult]);
+    void speak(lastResult || "There is no result yet. Tap once to scan.");
+  }, [lastResult, speak]);
 
   return (
     <div className="relative h-dvh w-full overflow-hidden bg-scene">
@@ -194,33 +217,33 @@ function WeSee() {
         />
       )}
 
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 border-t-4 border-accent bg-panel px-5 pb-10 pt-6">
-        <p className="text-status font-extrabold text-accent">{statusText}</p>
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 max-h-[55dvh] overflow-y-auto border-t-4 border-accent bg-panel px-5 pb-[max(2.5rem,env(safe-area-inset-bottom))] pt-6">
+        <p className="text-[clamp(24px,5vw,36px)] leading-[clamp(30px,6vw,42px)] font-extrabold text-accent">{statusText}</p>
         <p
           role="status"
           aria-live="polite"
-          className="mt-3 min-h-[68px] text-caption font-medium text-scene-foreground"
+          className="mt-3 min-h-[48px] text-[clamp(18px,4vw,26px)] leading-[clamp(24px,5vw,34px)] font-medium text-scene-foreground sm:min-h-[68px]"
         >
           {caption}
         </p>
-        <p className="mt-3 text-hint text-muted-strong">
+        <p className="mt-3 text-[clamp(14px,3vw,18px)] leading-[clamp(18px,4vw,24px)] text-muted-strong">
           Tap anywhere to scan. Double tap or long press to repeat. Assistive aid only — it can be
           wrong.
         </p>
       </div>
 
       {showNotice && (
-        <div className="absolute inset-0 z-30 flex flex-col justify-end bg-scene px-5 pb-12 pt-10">
-          <h1 className="text-status font-extrabold text-accent">WeSee</h1>
-          <p className="mt-4 text-caption font-medium text-scene-foreground">{PRIVACY_TEXT}</p>
-          <p className="mt-3 text-hint text-muted-strong">
+        <div className="absolute inset-0 z-30 flex flex-col justify-end overflow-y-auto bg-scene px-5 pb-[max(3rem,env(safe-area-inset-bottom))] pt-10">
+          <h1 className="text-[clamp(24px,5vw,36px)] leading-[clamp(30px,6vw,42px)] font-extrabold text-accent">WeSee</h1>
+          <p className="mt-4 text-[clamp(18px,4vw,26px)] leading-[clamp(24px,5vw,34px)] font-medium text-scene-foreground">{PRIVACY_TEXT}</p>
+          <p className="mt-3 text-[clamp(14px,3vw,18px)] leading-[clamp(18px,4vw,24px)] text-muted-strong">
             On iPhone there is no vibration, and you add WeSee to your home screen with Share, then
             Add to Home Screen.
           </p>
           <button
             type="button"
             onClick={acceptNotice}
-            className="mt-8 w-full rounded-xl bg-accent px-6 py-6 text-status font-extrabold text-scene"
+            className="mt-8 w-full rounded-xl bg-accent px-6 py-5 text-[clamp(20px,4.5vw,36px)] font-extrabold text-scene sm:py-6"
           >
             Start
           </button>
