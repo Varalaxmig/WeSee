@@ -51,6 +51,11 @@ function WeSee() {
   // Tracks the currently-playing HTML5 Audio element (Sarvam TTS) so we
   // can pause it before starting anything new.
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Tracks an Audio element that has been created but not yet started
+  // playing (between `new Audio()` and `audio.play()` resolving).
+  // This closes the race where cancelAllAudio fires between those two
+  // moments and misses the element.
+  const pendingAudioRef = useRef<HTMLAudioElement | null>(null);
   // Generation counter: incremented on every speak() call.  Each call
   // captures its own generation and bails after any await if a newer
   // call has since bumped the counter.  This is what prevents the
@@ -66,6 +71,17 @@ function WeSee() {
   const describe = useServerFn(describeScene);
   const sarvamTTS = useServerFn(speakWithSarvam);
 
+  // ── Kill a single Audio element unconditionally ───────────────────
+  const destroyAudio = useCallback((a: HTMLAudioElement | null) => {
+    if (!a) return;
+    a.pause();
+    a.currentTime = 0;
+    a.onended = null;
+    a.onerror = null;
+    a.removeAttribute("src");
+    a.load(); // forces the browser to release the audio buffer
+  }, []);
+
   // ── Cancel every audio source ─────────────────────────────────────
   // Must be called before ANY new speech trigger so that at most one
   // voice is ever audible.  Also bumps the generation so any in-flight
@@ -74,22 +90,34 @@ function WeSee() {
     // Bump generation to invalidate any in-flight speak() calls
     speakGenRef.current += 1;
 
-    // 1. Stop the HTML5 Audio element (Sarvam TTS)
-    if (activeAudioRef.current) {
-      const a = activeAudioRef.current;
-      a.pause();
-      a.currentTime = 0;
-      a.onended = null;
-      a.onerror = null;
-      a.removeAttribute("src");
-      a.load(); // forces the browser to release the audio buffer
-      activeAudioRef.current = null;
-    }
-    // 2. Stop the Web Speech API
+    // 1. Stop the currently-playing HTML5 Audio element (Sarvam TTS)
+    destroyAudio(activeAudioRef.current);
+    activeAudioRef.current = null;
+
+    // 2. Stop any pending (created but not yet playing) Audio element
+    destroyAudio(pendingAudioRef.current);
+    pendingAudioRef.current = null;
+
+    // 3. Stop the Web Speech API
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
     }
-  }, []);
+  }, [destroyAudio]);
+
+  // ── Lightweight browser-only speech (no network call) ─────────────
+  // Used for short UI cues like "Scanning" that don't need Sarvam TTS.
+  // Cancels all audio first so only one voice plays at a time.
+  const speakBrowserOnly = useCallback(
+    (text: string) => {
+      cancelAllAudio();
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "en-IN";
+      u.rate = 1;
+      window.speechSynthesis.speak(u);
+    },
+    [cancelAllAudio],
+  );
 
   // ── Speak: single source of truth for audio output ────────────────
   // Tries Sarvam TTS first; falls back to browser speechSynthesis.
@@ -113,26 +141,39 @@ function WeSee() {
 
         if (result.success && result.audioBase64) {
           const audio = new Audio(`data:audio/wav;base64,${result.audioBase64}`);
-          activeAudioRef.current = audio;
+
+          // Register as pending so cancelAllAudio() can find it
+          pendingAudioRef.current = audio;
 
           // Release the ref when playback ends naturally
           const cleanup = () => {
             if (activeAudioRef.current === audio) {
               activeAudioRef.current = null;
             }
+            if (pendingAudioRef.current === audio) {
+              pendingAudioRef.current = null;
+            }
           };
           audio.onended = cleanup;
           audio.onerror = cleanup;
 
+          // ── Stale check right before play ─────────────────────────
+          if (gen !== speakGenRef.current) {
+            destroyAudio(audio);
+            pendingAudioRef.current = null;
+            return;
+          }
+
           try {
             await audio.play();
+            // Promote from pending to active
+            pendingAudioRef.current = null;
+            activeAudioRef.current = audio;
+
             // Stale check after play() resolves (it resolves when
             // playback *starts*, not when it finishes).
             if (gen !== speakGenRef.current) {
-              audio.pause();
-              audio.currentTime = 0;
-              audio.onended = null;
-              audio.onerror = null;
+              destroyAudio(audio);
               activeAudioRef.current = null;
             }
             return; // Sarvam audio is playing (or was cancelled) — done.
@@ -158,7 +199,7 @@ function WeSee() {
       u.rate = 1;
       window.speechSynthesis.speak(u);
     },
-    [cancelAllAudio, sarvamTTS],
+    [cancelAllAudio, destroyAudio, sarvamTTS],
   );
 
   // ── Privacy-notice check (runs once) ──────────────────────────────
@@ -230,7 +271,7 @@ function WeSee() {
     setStatus("scanning");
     setStatusText("Scanning…");
     setCaption("");
-    void speak("Scanning");
+    void speakBrowserOnly("Scanning");
     buzz(60);
 
     try {
@@ -268,7 +309,7 @@ function WeSee() {
     } finally {
       scanningRef.current = false;
     }
-  }, [describe, speak, startCamera, status]);
+  }, [describe, speak, speakBrowserOnly, startCamera, status]);
 
   const repeat = useCallback(() => {
     if (scanningRef.current) return;
