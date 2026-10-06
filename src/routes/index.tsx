@@ -32,15 +32,6 @@ const PRIVACY_TEXT =
 
 type Status = "idle" | "starting" | "ready" | "scanning" | "error";
 
-function speakBrowser(text: string) {
-  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-  window.speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = "en-IN";
-  u.rate = 1;
-  window.speechSynthesis.speak(u);
-}
-
 function buzz(pattern: number | number[]) {
   if (typeof navigator !== "undefined" && "vibrate" in navigator) {
     try {
@@ -56,6 +47,16 @@ function WeSee() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const scanningRef = useRef(false);
 
+  // ── Audio deduplication refs ──────────────────────────────────────
+  // Tracks the currently-playing HTML5 Audio element (Sarvam TTS) so we
+  // can pause it before starting anything new.
+  const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Generation counter: incremented on every speak() call.  Each call
+  // captures its own generation and bails after any await if a newer
+  // call has since bumped the counter.  This is what prevents the
+  // "two Sarvam responses both calling audio.play()" race.
+  const speakGenRef = useRef(0);
+
   const [status, setStatus] = useState<Status>("idle");
   const [statusText, setStatusText] = useState("Starting camera…");
   const [caption, setCaption] = useState("");
@@ -65,34 +66,109 @@ function WeSee() {
   const describe = useServerFn(describeScene);
   const sarvamTTS = useServerFn(speakWithSarvam);
 
-  // Speak using Sarvam TTS first, fallback to browser speechSynthesis
+  // ── Cancel every audio source ─────────────────────────────────────
+  // Must be called before ANY new speech trigger so that at most one
+  // voice is ever audible.  Also bumps the generation so any in-flight
+  // speak() call knows it has been superseded.
+  const cancelAllAudio = useCallback(() => {
+    // Bump generation to invalidate any in-flight speak() calls
+    speakGenRef.current += 1;
+
+    // 1. Stop the HTML5 Audio element (Sarvam TTS)
+    if (activeAudioRef.current) {
+      const a = activeAudioRef.current;
+      a.pause();
+      a.currentTime = 0;
+      a.onended = null;
+      a.onerror = null;
+      a.removeAttribute("src");
+      a.load(); // forces the browser to release the audio buffer
+      activeAudioRef.current = null;
+    }
+    // 2. Stop the Web Speech API
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+  }, []);
+
+  // ── Speak: single source of truth for audio output ────────────────
+  // Tries Sarvam TTS first; falls back to browser speechSynthesis.
+  // Every call cancels whatever is currently playing.  The generation
+  // counter prevents stale async results from producing sound.
   const speak = useCallback(
     async (text: string) => {
+      // 1. Kill anything currently playing
+      cancelAllAudio();
+
+      // 2. Claim a new generation.  Any older in-flight call will see
+      //    its saved generation !== speakGenRef.current and bail.
+      const gen = speakGenRef.current;
+
+      // 3. Try Sarvam TTS (network call — takes time)
       try {
-        // Stop any ongoing browser speech
-        if (typeof window !== "undefined" && "speechSynthesis" in window) {
-          window.speechSynthesis.cancel();
-        }
         const result = await sarvamTTS({ data: { text, language: "en-IN" } });
+
+        // ── Stale check: has a newer speak() fired while we waited? ──
+        if (gen !== speakGenRef.current) return;
+
         if (result.success && result.audioBase64) {
           const audio = new Audio(`data:audio/wav;base64,${result.audioBase64}`);
-          audio.play().catch(() => speakBrowser(text));
-          return;
+          activeAudioRef.current = audio;
+
+          // Release the ref when playback ends naturally
+          const cleanup = () => {
+            if (activeAudioRef.current === audio) {
+              activeAudioRef.current = null;
+            }
+          };
+          audio.onended = cleanup;
+          audio.onerror = cleanup;
+
+          try {
+            await audio.play();
+            // Stale check after play() resolves (it resolves when
+            // playback *starts*, not when it finishes).
+            if (gen !== speakGenRef.current) {
+              audio.pause();
+              audio.currentTime = 0;
+              audio.onended = null;
+              audio.onerror = null;
+              activeAudioRef.current = null;
+            }
+            return; // Sarvam audio is playing (or was cancelled) — done.
+          } catch {
+            // play() rejected (e.g. autoplay policy).
+            cleanup();
+            // Fall through to browser TTS.
+          }
         }
       } catch {
-        // Sarvam unavailable — fall through
+        // Sarvam network error — fall through to browser TTS.
       }
-      speakBrowser(text);
+
+      // ── Stale check before browser fallback ───────────────────────
+      if (gen !== speakGenRef.current) return;
+
+      // ── Browser speech fallback ───────────────────────────────────
+      if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+
+      window.speechSynthesis.cancel(); // belt-and-suspenders
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "en-IN";
+      u.rate = 1;
+      window.speechSynthesis.speak(u);
     },
-    [sarvamTTS],
+    [cancelAllAudio, sarvamTTS],
   );
 
+  // ── Privacy-notice check (runs once) ──────────────────────────────
   useEffect(() => {
     const seen =
       typeof window !== "undefined" && window.localStorage.getItem("wesee.notice") === "1";
     if (!seen) setShowNotice(true);
   }, []);
 
+  // ── Camera startup ────────────────────────────────────────────────
   const startCamera = useCallback(async () => {
     setStatus("starting");
     setStatusText("Starting camera…");
@@ -119,19 +195,27 @@ function WeSee() {
     }
   }, [speak]);
 
+  // Start camera once the notice is dismissed.
+  // Cleanup: cancel audio if the effect re-fires (React Strict Mode)
+  // or the component unmounts.
   useEffect(() => {
     if (!showNotice) void startCamera();
-  }, [showNotice, startCamera]);
+    return () => cancelAllAudio();
+  }, [showNotice, startCamera, cancelAllAudio]);
 
   const acceptNotice = () => {
     window.localStorage.setItem("wesee.notice", "1");
     setShowNotice(false);
   };
 
+  // Speak privacy text when notice is shown.
+  // Cleanup: cancel if re-rendered or unmounted.
   useEffect(() => {
     if (showNotice) void speak(PRIVACY_TEXT);
-  }, [showNotice, speak]);
+    return () => cancelAllAudio();
+  }, [showNotice, speak, cancelAllAudio]);
 
+  // ── Scan handler ──────────────────────────────────────────────────
   const scan = useCallback(async () => {
     if (scanningRef.current) return;
     if (status === "error" || status === "idle") {
@@ -193,6 +277,19 @@ function WeSee() {
 
   return (
     <div className="relative h-dvh w-full overflow-hidden bg-scene">
+      {/* Visually-hidden live region for screen readers — announces only
+          short status changes, NOT the full description (which is already
+          spoken programmatically by speak()).  This prevents the screen
+          reader from producing a second voice on top of the TTS audio. */}
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        className="sr-only"
+      >
+        {statusText}
+      </div>
+
       <video
         ref={videoRef}
         playsInline
@@ -219,9 +316,10 @@ function WeSee() {
 
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 max-h-[55dvh] overflow-y-auto border-t-4 border-accent bg-panel px-5 pb-[max(2.5rem,env(safe-area-inset-bottom))] pt-6">
         <p className="text-[clamp(24px,5vw,36px)] leading-[clamp(30px,6vw,42px)] font-extrabold text-accent">{statusText}</p>
+        {/* No aria-live here — the caption text is already spoken aloud by
+            the speak() function.  Adding aria-live would cause a screen
+            reader to read it AGAIN, producing the dual-voice bug. */}
         <p
-          role="status"
-          aria-live="polite"
           className="mt-3 min-h-[48px] text-[clamp(18px,4vw,26px)] leading-[clamp(24px,5vw,34px)] font-medium text-scene-foreground sm:min-h-[68px]"
         >
           {caption}
